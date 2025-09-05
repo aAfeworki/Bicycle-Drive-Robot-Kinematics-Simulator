@@ -1,0 +1,293 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.widgets import Button, CheckButtons
+from matplotlib.patches import Polygon
+
+# ---------------------------
+# Bicycle Drive Simulator with IK
+# ---------------------------
+
+# Parameters
+r = 0.05      # tire radius [m]
+d = 0.40      # wheelbase [m]
+Ts = 0.05     # integration timestep [s]
+
+# Vehicle visual geometry
+wheel_len = 0.14
+wheel_wid = 0.05
+
+# Initial state
+X, Y, gamma = 0.0, 0.0, 0.0   # position and heading (rear axle reference)
+alpha = 0.0                   # steering angle (rad)
+V = 0.0
+w = 0.0
+
+# Controller / motion settings
+goal_tol = 0.05       # meters: when closer than this, goal considered reached
+V_max = 1.0           # max forward speed [m/s]
+K_rho = 4.2           # proportional gain on distance
+K_alpha = 4.2         # gain on heading error -> steering command
+alpha_max = np.pi/3   # max steering angle (±60°)
+
+# State / UI flags
+_running = {"flag": True}
+_leave_path = {"flag": True}   # mirror of "Leave Path" checkbox in UI
+_show_icr = {"flag": True}
+
+# Waypoints queue (clicks)
+target_pts = []  # list of (x,y) tuples, FIFO
+
+# Path trace
+path_x, path_y = [X], [Y]
+
+# ---------------------------
+# Helper functions
+# ---------------------------
+def rot2d(theta):
+    c, s = np.cos(theta), np.sin(theta)
+    return np.array([[c, -s], [s, c]])
+
+def rect_polygon(cx, cy, length, width, heading):
+    half_l, half_w = length / 2.0, width / 2.0
+    corners_local = np.array([
+        [ half_l,  half_w],
+        [ half_l, -half_w],
+        [-half_l, -half_w],
+        [-half_l,  half_w],
+    ])
+    Rm = rot2d(heading)
+    return (Rm @ corners_local.T).T + np.array([cx, cy])
+
+def icr_from_alpha(alpha_val, Xc, Yc, heading):
+    """Compute R and ICR position from steering angle alpha.
+       R = d/tan(alpha). If alpha==0 -> straight (R=inf).
+    """
+    if abs(np.tan(alpha_val)) < 1e-9:
+        return np.inf, np.nan, np.nan
+    R = d / np.tan(alpha_val)
+    x_icr = Xc - R * np.sin(heading)
+    y_icr = Yc + R * np.cos(heading)
+    return R, x_icr, y_icr
+
+def wrap_to_pi(a):
+    return (a + np.pi) % (2 * np.pi) - np.pi
+
+# ---------------------------
+# Matplotlib figure & artists
+# ---------------------------
+plt.close("all")
+fig = plt.figure(figsize=(10, 7))
+ax = fig.add_axes([0.06, 0.08, 0.66, 0.88])
+ax.set_aspect("equal", adjustable="box")
+ax.set_xlim(-2, 2)
+ax.set_ylim(-2, 2)
+ax.grid(True, alpha=0.3)
+ax.set_title("Bicycle Model (Inverse Kinematics)")
+
+# Path trace line
+path_line, = ax.plot(path_x, path_y, lw=1.5, alpha=0.8)
+
+# Rear wheel rectangle (vehicle reference)
+rear_poly = Polygon(rect_polygon(X, Y, wheel_len, wheel_wid, gamma),
+                    closed=True, facecolor="tab:blue", edgecolor="k", lw=1.5)
+ax.add_patch(rear_poly)
+
+# Front wheel rectangle (visual)
+fx = X + d * np.cos(gamma)
+fy = Y + d * np.sin(gamma)
+front_poly = Polygon(rect_polygon(fx, fy, wheel_len, wheel_wid, gamma + alpha),
+                     closed=True, facecolor="tab:red", edgecolor="k", lw=1.5)
+ax.add_patch(front_poly)
+
+# Link line between rear and front wheel centers
+link_line, = ax.plot([X, fx], [Y, fy], "k-", lw=2)
+
+# ICR marker
+icr_marker = ax.scatter([], [], s=40, marker="x", color="tab:green")
+
+# Target markers scatter (fixed: pass Nx2 array or empty (0,2) array)
+target_scat = ax.scatter(np.empty((0, 2)), np.empty((0, 2)), s=50, marker="o", color="magenta")
+
+# Info box (top-right)
+infotxt = ax.text(0.99, 0.98, "", transform=ax.transAxes, ha="right", va="top",
+                  bbox=dict(boxstyle="round", facecolor="white", alpha=0.90, lw=0.8),
+                  family="monospace", fontsize=9)
+
+# ---------------------------
+# Update visuals function
+# ---------------------------
+def update_robot_artist():
+    """Update vehicle visuals, ICR, path, targets and info text."""
+    global X, Y, gamma, alpha, V, w
+
+    # Rear wheel (vehicle body reference)
+    rear_poly.set_xy(rect_polygon(X, Y, wheel_len, wheel_wid, gamma))
+
+    # Front wheel position & rotation (front wheel steered by alpha)
+    fx = X + d * np.cos(gamma)
+    fy = Y + d * np.sin(gamma)
+    front_poly.set_xy(rect_polygon(fx, fy, wheel_len, wheel_wid, gamma + alpha))
+
+    # Link between centers
+    link_line.set_data([X, fx], [Y, fy])
+
+    # ICR marker
+    Rcur, x_icr, y_icr = icr_from_alpha(alpha, X, Y, gamma)
+    if _show_icr["flag"] and np.isfinite(Rcur):
+        icr_marker.set_offsets([[x_icr, y_icr]])
+        icr_marker.set_visible(True)
+    else:
+        icr_marker.set_offsets(np.empty((0, 2)))
+        icr_marker.set_visible(False)
+
+    # Path trace (respect Leave Path state)
+    if _leave_path["flag"]:
+        path_line.set_data(path_x, path_y)
+    else:
+        # only draw current position as single-point path
+        path_line.set_data([X], [Y])
+
+    # Targets scatter: supply Nx2 array or an empty (0,2) array
+    if _leave_path["flag"] and len(target_pts) > 0:
+        target_scat.set_offsets(np.array(target_pts))
+    else:
+        target_scat.set_offsets(np.empty((0, 2)))
+
+    # Info box
+    R_str = f"{Rcur: .3f} m" if np.isfinite(Rcur) else "  ∞"
+    infotxt.set_text(
+        f"ICR R: {R_str}\n"
+        f"V: {V: .4f} m/s\n"
+        f"w: {w: .4f} rad/s\n"
+        f"alpha: {alpha: .4f} rad ({np.degrees(alpha):.1f}°)\n"
+        f"X: {X: .4f} m\n"
+        f"Y: {Y: .4f} m"
+    )
+
+# ---------------------------
+# UI controls
+# ---------------------------
+ax_btn_run = fig.add_axes([0.78, 0.36, 0.085, 0.05])
+ax_btn_rst = fig.add_axes([0.875, 0.36, 0.085, 0.05])
+btn_run = Button(ax_btn_run, "Run/Pause")
+btn_rst = Button(ax_btn_rst, "Reset")
+
+ax_chk = fig.add_axes([0.78, 0.23, 0.18, 0.12])
+chk = CheckButtons(ax_chk, ["Show ICR", "Leave Path"], [True, True])
+chk_labels = [lbl.get_text() for lbl in chk.labels]
+
+def toggle_run(event):
+    _running["flag"] = not _running["flag"]
+
+def do_reset(event):
+    global X, Y, gamma, alpha, V, w, path_x, path_y, target_pts
+    X, Y, gamma = 0.0, 0.0, 0.0
+    alpha = 0.0
+    V, w = 0.0, 0.0
+    path_x, path_y = [X], [Y]
+    target_pts.clear()
+    update_robot_artist()
+    fig.canvas.draw_idle()
+
+btn_run.on_clicked(toggle_run)
+btn_rst.on_clicked(do_reset)
+
+def on_check(label):
+    states = dict(zip(chk_labels, chk.get_status()))
+    _show_icr["flag"] = states.get("Show ICR", True)
+    _leave_path["flag"] = states.get("Leave Path", True)
+
+    # If Leave Path is turned OFF, clear path and clicked dots
+    if not _leave_path["flag"]:
+        path_x[:] = [X]
+        path_y[:] = [Y]
+        target_pts.clear()
+
+    update_robot_artist()
+    fig.canvas.draw_idle()
+
+chk.on_clicked(on_check)
+
+# ---------------------------
+# Mouse click handler (enqueue waypoint)
+# ---------------------------
+def on_click(event):
+    if event.inaxes != ax or event.xdata is None or event.ydata is None:
+        return
+    # Add waypoint to queue
+    target_pts.append((event.xdata, event.ydata))
+    update_robot_artist()
+    fig.canvas.draw_idle()
+
+fig.canvas.mpl_connect("button_press_event", on_click)
+
+# ---------------------------
+# Controller + simulation step
+# ---------------------------
+def step():
+    global X, Y, gamma, alpha, V, w
+
+    if not _running["flag"]:
+        return
+
+    if len(target_pts) == 0:
+        # no goal: stop vehicle
+        V = 0.0
+        w = 0.0
+        return
+
+    # Current goal is first in queue
+    gx, gy = target_pts[0]
+    dx = gx - X
+    dy = gy - Y
+    rho = np.hypot(dx, dy)
+
+    # If goal reached, pop it and move to next
+    if rho < goal_tol:
+        target_pts.pop(0)
+        # if no more goals, stop
+        if len(target_pts) == 0:
+            V = 0.0
+            w = 0.0
+        return
+
+    # Heading to goal and heading error
+    desired_heading = np.arctan2(dy, dx)
+    heading_err = wrap_to_pi(desired_heading - gamma)
+
+    # Steering command (alpha) from heading error (P-control -> clipped)
+    alpha_cmd = np.clip(K_alpha * heading_err, -alpha_max, alpha_max)
+    alpha = float(alpha_cmd)  # update steering angle
+
+    # Forward speed commanded from distance (P with saturation)
+    V_cmd = min(V_max, K_rho * rho)
+    V = float(V_cmd)
+
+    # Bicycle kinematic yaw rate
+    w = (V / d) * np.tan(alpha)
+
+    # Integrate pose
+    gamma = wrap_to_pi(gamma + w * Ts)
+    X += V * Ts * np.cos(gamma)
+    Y += V * Ts * np.sin(gamma)
+
+    # Path trace accumulation (only if leave_path enabled)
+    if _leave_path["flag"]:
+        path_x.append(X)
+        path_y.append(Y)
+    else:
+        # keep single point to avoid growth
+        path_x[:] = [X]
+        path_y[:] = [Y]
+
+    update_robot_artist()
+    fig.canvas.draw_idle()
+
+# Create and start timer
+timer = fig.canvas.new_timer(interval=int(Ts * 1000))
+timer.add_callback(step)
+timer.start()
+
+# Initial draw
+update_robot_artist()
+plt.show()

@@ -1,0 +1,365 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.widgets import Slider, Button, CheckButtons
+from matplotlib.patches import Polygon
+
+# ---------------------------
+# Bicycle Drive Simulator
+# ---------------------------
+
+# Parameters
+r = 0.05      # tire radius [m]
+d = 0.40      # wheelbase [m] (distance front->rear)
+Ts = 0.05     # integration timestep [s]
+
+# Wheel geometry (visual)
+wheel_len = 0.14
+wheel_wid = 0.05
+
+# Initial state
+X, Y, gamma = 0.0, 0.0, 0.0   # position + heading
+alpha = 0.0                   # steering angle (rad), in [-pi/2, pi/2]
+ws = 0.0                      # steering tire angular velocity (rad/s)
+Vs = ws * r                   # steering linear speed along tire
+V = Vs * np.cos(alpha)        # forward speed of vehicle
+w = 0.0                       # angular velocity (about ICR)
+
+# Simulation flags / guards
+_running = {"flag": True}
+_updating = {"flag": False}   # prevent recursive slider updates
+timer = None
+
+# ---------------------------
+# Helpers
+# ---------------------------
+def rot2d(theta):
+    c, s = np.cos(theta), np.sin(theta)
+    return np.array([[c, -s], [s, c]])
+
+def rect_polygon(cx, cy, length, width, heading):
+    """Return polygon vertices for a rectangle at (cx,cy) rotated by heading."""
+    half_l, half_w = length / 2.0, width / 2.0
+    corners_local = np.array([
+        [ half_l,  half_w],
+        [ half_l, -half_w],
+        [-half_l, -half_w],
+        [-half_l,  half_w],
+    ])
+    Rm = rot2d(heading)
+    pts = (Rm @ corners_local.T).T + np.array([cx, cy])
+    return pts
+
+def icr_from_alpha(alpha_val, Xc, Yc, heading):
+    """Compute R and ICR position from steering angle alpha.
+       R = d/tan(alpha). If alpha==0 -> straight (R=inf).
+    """
+    if abs(np.tan(alpha_val)) < 1e-9:
+        return np.inf, np.nan, np.nan
+    R = d / np.tan(alpha_val)
+    x_icr = Xc - R * np.sin(heading)
+    y_icr = Yc + R * np.cos(heading)
+    return R, x_icr, y_icr
+
+# ---------------------------
+# Matplotlib figure & artists
+# ---------------------------
+plt.close("all")
+fig = plt.figure(figsize=(10, 7))
+ax = fig.add_axes([0.06, 0.08, 0.66, 0.88])
+ax.set_aspect("equal", adjustable="box")
+ax.set_xlim(-2, 2)
+ax.set_ylim(-2, 2)
+ax.grid(True, alpha=0.3)
+ax.set_title("Bicycle Drive Robot")
+
+# Path trace
+path_x, path_y = [X], [Y]
+path_line, = ax.plot(path_x, path_y, lw=1.5, alpha=0.8)
+
+# Rear wheel rectangle (at rear axle position = vehicle reference)
+rear_poly = Polygon(rect_polygon(X, Y, wheel_len, wheel_wid, gamma),
+                    closed=True, facecolor="blue", edgecolor="k", lw=1.5)
+ax.add_patch(rear_poly)
+
+# Front wheel rectangle (visual) -- position depends on gamma and d
+front_x = X + d * np.cos(gamma)
+front_y = Y + d * np.sin(gamma)
+front_poly = Polygon(rect_polygon(front_x, front_y, wheel_len, wheel_wid, gamma + alpha),
+                     closed=True, facecolor="red", edgecolor="k", lw=1.5)
+ax.add_patch(front_poly)
+
+# Link line between wheel centers
+link_line, = ax.plot([X, front_x], [Y, front_y], "k-", lw=2)
+
+# ICR marker (controlled by checkbox)
+icr_marker = ax.scatter([], [], s=40, marker="x", color="tab:green")
+
+# Info box
+infotxt = ax.text(0.99, 0.98, "", transform=ax.transAxes, ha="right", va="top",
+                  bbox=dict(boxstyle="round", facecolor="white", alpha=0.90, lw=0.8),
+                  family="monospace", fontsize=9)
+
+# ---------------------------
+# Update visuals
+# ---------------------------
+def update_robot_artist():
+    """Update rectangles, link, ICR, path and info box."""
+    global X, Y, gamma, alpha, ws, Vs, V, w
+    # Rear wheel
+    rear_poly.set_xy(rect_polygon(X, Y, wheel_len, wheel_wid, gamma))
+    # Front wheel (position & steering rotation)
+    fx = X + d * np.cos(gamma)
+    fy = Y + d * np.sin(gamma)
+    front_poly.set_xy(rect_polygon(fx, fy, wheel_len, wheel_wid, gamma + alpha))
+    # Link
+    link_line.set_data([X, fx], [Y, fy])
+    # ICR (from alpha)
+    Rcur, x_icr, y_icr = icr_from_alpha(alpha, X, Y, gamma)
+    if np.isfinite(Rcur):
+        icr_marker.set_offsets([[x_icr, y_icr]])
+    else:
+        icr_marker.set_offsets(np.empty((0, 2)))
+    # Path
+    path_line.set_data(path_x, path_y)
+    # Info text
+    info = (
+        f"V: {V: .4f} m/s\n"
+        f"w: {w: .4f} rad/s\n"
+        f"alpha: {alpha: .4f} rad ({np.degrees(alpha):.1f}°)\n"
+        f"ws: {ws: .4f} rad/s\n"
+        f"X: {X: .4f} m\n"
+        f"Y: {Y: .4f} m"
+    )
+    infotxt.set_text(info)
+
+# ---------------------------
+# UI controls
+# ---------------------------
+axcolor = "lightgoldenrodyellow"
+ax_ws = fig.add_axes([0.78, 0.78, 0.18, 0.03], facecolor=axcolor)
+ax_alpha = fig.add_axes([0.78, 0.73, 0.18, 0.03], facecolor=axcolor)
+ax_V  = fig.add_axes([0.78, 0.62, 0.18, 0.03], facecolor=axcolor)
+ax_w  = fig.add_axes([0.78, 0.57, 0.18, 0.03], facecolor=axcolor)
+ax_ts = fig.add_axes([0.78, 0.46, 0.18, 0.03], facecolor=axcolor)
+
+# Slider ranges same as before
+s_ws = Slider(ax_ws, "ws [rad/s]", -50.0, 50.0, valinit=ws, valstep=0.01)
+s_alpha = Slider(ax_alpha, "α [rad]", -np.pi/2, np.pi/2, valinit=alpha, valstep=0.001)
+s_V  = Slider(ax_V, "V [m/s]", 0.0, 2.0, valinit=V, valstep=0.001)
+s_w  = Slider(ax_w, "w [rad/s]", -10.0, 10.0, valinit=w, valstep=0.001)
+s_ts = Slider(ax_ts, "Ts [s]", 0.01, 0.2, valinit=Ts, valstep=0.005)
+
+ax_btn_run = fig.add_axes([0.78, 0.36, 0.085, 0.05])
+ax_btn_rst = fig.add_axes([0.875, 0.36, 0.085, 0.05])
+btn_run = Button(ax_btn_run, "Run/Pause")
+btn_rst = Button(ax_btn_rst, "Reset")
+
+# Checkboxes: Show ICR (top), Leave Path (below)
+ax_chk = fig.add_axes([0.78, 0.23, 0.18, 0.12])
+chk = CheckButtons(ax_chk, ["Show ICR", "Leave Path"], [True, True])
+chk_labels = [lbl.get_text() for lbl in chk.labels]
+icr_marker.set_visible(True)
+
+# ---------------------------
+# Sync rules implementing constraints
+# ---------------------------
+def sync_from_alpha_ws():
+    """Primary actuators change: alpha and ws -> update Vs, V, w and update sliders."""
+    global Vs, V, w
+    Vs = ws * r
+    V = Vs * np.cos(alpha)
+    w = (Vs / d) * np.sin(alpha)
+    # sync sliders for derived quantities
+    if not _updating["flag"]:
+        _updating["flag"] = True
+        # clamp V and w to slider ranges by set_val (Slider will clamp)
+        s_V.set_val(V)
+        s_w.set_val(w)
+        _updating["flag"] = False
+
+def on_ws(val):
+    """User moved ws slider: update ws (actuator) and derived V,w."""
+    global ws
+    if _updating["flag"]:
+        return
+    ws = s_ws.val
+    sync_from_alpha_ws()
+    update_robot_artist()
+    fig.canvas.draw_idle()
+
+def on_alpha(val):
+    """User moved alpha slider: update alpha and derived V,w."""
+    global alpha
+    if _updating["flag"]:
+        return
+    alpha = np.clip(s_alpha.val, -np.pi/2, np.pi/2)
+    sync_from_alpha_ws()
+    update_robot_artist()
+    fig.canvas.draw_idle()
+
+def on_V(val):
+    global V, Vs, ws
+    if _updating["flag"]:
+        return
+    desired_V = s_V.val
+    cos_a = np.cos(alpha)
+    # If cos_a very small, we cannot achieve arbitrary V without huge Vs/ws -> clamp using ws slider limits
+    if abs(cos_a) < 1e-6:
+        # compute maximum achievable Vs from ws slider limits:
+        ws_min, ws_max = s_ws.valmin, s_ws.valmax
+        # choose ws magnitude that gives largest |V| in same sign as desired_V
+        ws_candidate = ws_max if desired_V >= 0 else -ws_max
+        Vs_candidate = ws_candidate * r
+        V_actual = Vs_candidate * cos_a  # likely ~0
+        # update ws to clipped candidate
+        if not _updating["flag"]:
+            _updating["flag"] = True
+            s_ws.set_val(ws_candidate)
+            _updating["flag"] = False
+        ws = ws_candidate
+        Vs = Vs_candidate
+        V = V_actual
+        # update derived w
+        w_val = (Vs / d) * np.sin(alpha)
+        if not _updating["flag"]:
+            _updating["flag"] = True
+            s_w.set_val(w_val)
+            s_V.set_val(V)
+            _updating["flag"] = False
+    else:
+        # normal case: compute Vs needed
+        Vs_target = desired_V / cos_a
+        ws_target = Vs_target / r
+        # clamp ws_target to slider range
+        ws_clamped = np.clip(ws_target, s_ws.valmin, s_ws.valmax)
+        Vs = ws_clamped * r
+        ws = ws_clamped
+        # recompute actual V and w from final ws and alpha
+        V = Vs * cos_a
+        w_val = (Vs / d) * np.sin(alpha)
+        # sync sliders (guarded)
+        if not _updating["flag"]:
+            _updating["flag"] = True
+            s_ws.set_val(ws)
+            s_w.set_val(w_val)
+            s_V.set_val(V)
+            _updating["flag"] = False
+    update_robot_artist()
+    fig.canvas.draw_idle()
+
+def on_w(val):
+    global w, alpha, Vs, V
+    if _updating["flag"]:
+        return
+    desired_w = s_w.val
+    Vs = ws * r
+    if abs(Vs) < 1e-12:
+        # cannot change turning rate if steering linear speed is zero; revert slider
+        actual_w = (Vs / d) * np.sin(alpha)  # should be zero
+        if not _updating["flag"]:
+            _updating["flag"] = True
+            s_w.set_val(actual_w)
+            _updating["flag"] = False
+        w = actual_w
+    else:
+        sin_arg = desired_w * d / Vs
+        sin_clamped = np.clip(sin_arg, -1.0, 1.0)
+        alpha_new = np.arcsin(sin_clamped)
+        # ensure within allowed steering range
+        alpha_new = np.clip(alpha_new, -np.pi/2, np.pi/2)
+        alpha = alpha_new
+        # recompute V and actual w (from alpha & Vs)
+        V = Vs * np.cos(alpha)
+        w = (Vs / d) * np.sin(alpha)
+        # sync sliders without changing ws
+        if not _updating["flag"]:
+            _updating["flag"] = True
+            s_alpha.set_val(alpha)
+            s_V.set_val(V)
+            s_w.set_val(w)
+            _updating["flag"] = False
+    update_robot_artist()
+    fig.canvas.draw_idle()
+
+def on_ts(val):
+    global Ts, timer
+    Ts = s_ts.val
+    if timer is not None and hasattr(timer, "interval"):
+        timer.interval = int(Ts * 1000)
+
+# attach callbacks
+s_ws.on_changed(on_ws)
+s_alpha.on_changed(on_alpha)
+s_V.on_changed(on_V)
+s_w.on_changed(on_w)
+s_ts.on_changed(on_ts)
+
+# ---------------------------
+# Buttons / Checkboxes
+# ---------------------------
+def toggle_run(event):
+    _running["flag"] = not _running["flag"]
+
+def do_reset(event):
+    global X, Y, gamma, alpha, ws, Vs, V, w, path_x, path_y
+    X, Y, gamma = 0.0, 0.0, 0.0
+    alpha = 0.0
+    ws = 0.0
+    Vs = 0.0
+    V = 0.0
+    w = 0.0
+    path_x, path_y = [X], [Y]
+    # update UI under guard
+    if not _updating["flag"]:
+        _updating["flag"] = True
+        s_alpha.set_val(alpha)
+        s_ws.set_val(ws)
+        s_V.set_val(V)
+        s_w.set_val(w)
+        _updating["flag"] = False
+    update_robot_artist()
+    fig.canvas.draw_idle()
+
+btn_run.on_clicked(toggle_run)
+btn_rst.on_clicked(do_reset)
+
+def on_check(label):
+    states = dict(zip(chk_labels, chk.get_status()))
+    show_icr = states.get("Show ICR", True)
+    leave_path = states.get("Leave Path", True)
+    icr_marker.set_visible(show_icr)
+    if not leave_path:
+        path_x.clear()
+        path_y.clear()
+        path_x.append(X)
+        path_y.append(Y)
+    fig.canvas.draw_idle()
+
+chk.on_clicked(on_check)
+
+# ---------------------------
+# Simulation step (integration uses current V,w)
+# ---------------------------
+def step():
+    global X, Y, gamma
+    if not _running["flag"]:
+        return
+    # integrate heading and position using current V and w
+    gamma += w * Ts
+    X += V * Ts * np.cos(gamma)
+    Y += V * Ts * np.sin(gamma)
+    path_x.append(X)
+    path_y.append(Y)
+    update_robot_artist()
+    fig.canvas.draw_idle()
+
+# Timer
+timer = fig.canvas.new_timer(interval=int(Ts * 1000))
+timer.add_callback(step)
+timer.start()
+
+# Initial sync and draw
+# Ensure initial internal consistency and UI sync
+sync_from_alpha_ws()
+update_robot_artist()
+plt.show()
