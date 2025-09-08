@@ -33,7 +33,7 @@ This project includes two interactive modes:
 
 Requirements:
 
-    Python 3.8+
+    Python 3.12
 
     NumPy
 
